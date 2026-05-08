@@ -12,11 +12,11 @@ select_utf8_locale() {
     *[Uu][Tt][Ff]-8*|*[Uu][Tt][Ff]8*) candidates+=("$LANG") ;;
   esac
 
-  candidates+=("C.UTF-8" "en_US.UTF-8" "UTF-8")
+  candidates+=("C.UTF-8" "C.utf8" "en_US.UTF-8" "en_US.utf8" "UTF-8")
 
   for candidate in "${candidates[@]}"; do
     [ -n "$candidate" ] || continue
-    if locale -a 2>/dev/null | grep -Eiq "^${candidate//./[.]$}$"; then
+    if locale -a 2>/dev/null | grep -Fxiq "$candidate"; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -58,20 +58,51 @@ ensure_clean_utf8_env "$@"
 set -u
 
 # =========================================================
-# REALITY SNI probe - pro v2
+# REALITY SNI probe - pro v2.2
 # Focus: evaluate whether a domain is suitable as REALITY SNI
 # =========================================================
 
-JOBS=4
-TIMEOUT_SEC=10
-SAMPLES=3
-OUT_CSV=""
-OUT_JSON=""
-ONLY_GOOD=0
-MIN_SCORE=""
-TMP_ROOT=""
+JOBS="${JOBS:-1}"
+TIMEOUT_SEC="${TIMEOUT_SEC:-10}"
+SAMPLES="${SAMPLES:-3}"
+OUT_CSV="${OUT_CSV:-}"
+OUT_JSON="${OUT_JSON:-}"
+ONLY_GOOD="${ONLY_GOOD:-0}"
+MIN_SCORE="${MIN_SCORE:-}"
+TMP_ROOT="${TMP_ROOT:-}"
+JITTER_MS_MAX="${JITTER_MS_MAX:-0}"
+ASN_ENABLED="${ASN_ENABLED:-1}"
+ASN_TIMEOUT_SEC="${ASN_TIMEOUT_SEC:-5}"
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+curl_supports_http2() {
+  have_cmd curl && curl --version 2>/dev/null | grep -Eiq '(^|[[:space:]])HTTP2([[:space:]]|$)'
+}
+
+warn_dependencies() {
+  if ! have_cmd curl; then
+    echo "警告: 缺少 curl，HTTP 采样、H2、页面/WAF/跳转判断会退化。" >&2
+  elif ! curl_supports_http2; then
+    echo "警告: 当前 curl 未启用 HTTP/2，H2 会尽量用 OpenSSL ALPN 兜底，无法确认时标记为 未知。" >&2
+  fi
+
+  if ! have_cmd openssl; then
+    echo "警告: 缺少 openssl，TLS/证书/SAN/ALPN/OCSP 检测会退化。" >&2
+  fi
+
+  if [ "${ASN_ENABLED:-1}" = "1" ] && ! have_cmd whois; then
+    echo "警告: 缺少 whois，ASN 查询会退化为 未知；如不需要 ASN 可使用 --no-asn。" >&2
+  fi
+
+  if ! have_cmd timeout && ! have_cmd gtimeout; then
+    echo "警告: 缺少 timeout/gtimeout，openssl/whois 阶段无法被外层超时保护。" >&2
+  fi
+
+  if ! have_cmd getent && ! have_cmd dig && ! have_cmd nslookup; then
+    echo "警告: 缺少 getent/dig/nslookup，多 IP 一致性检测会退化为 单IP/未知。" >&2
+  fi
+}
 
 safe_timeout() {
   local secs="$1"
@@ -79,6 +110,8 @@ safe_timeout() {
 
   if have_cmd timeout; then
     timeout "$secs" "$@"
+  elif have_cmd gtimeout; then
+    gtimeout "$secs" "$@"
   else
     "$@"
   fi
@@ -98,11 +131,13 @@ usage() {
   -f FILE         域名文件
   -o FILE         导出 CSV
   --json FILE     导出 JSONL
-  -j NUM          并发数，默认 4
+  -j NUM          并发数，默认 1
   --timeout NUM   单次请求超时，默认 10
   --samples NUM   采样次数，默认 3
   --only-good     仅输出 推荐/可用
   --min-score N   仅输出分数 >= N
+  --jitter NUM    worker 启动随机延迟上限毫秒，默认 0 (禁用)
+  --no-asn        禁用 ASN 查询（默认启用，需 whois 或网络）
   -h, --help      帮助
 USAGE
 }
@@ -166,6 +201,111 @@ avg_nums() {
   awk '{s+=$1;n++} END{ if(n>0) printf "%.0f", s/n; else print "" }'
 }
 
+ms_or_dash() {
+  local v="${1:-}"
+  if [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -lt 999999 ]; then
+    printf '%sms' "$v"
+  else
+    printf '%s' '-'
+  fi
+}
+
+jitter_token() {
+  local label="$1"
+  local v="${2:-}"
+  printf '%s:%s' "$label" "$(ms_or_dash "$v")"
+}
+
+date_to_epoch() {
+  local ds="$1"
+  local epoch
+
+  [ -n "$ds" ] || return 1
+
+  if epoch="$(LC_TIME=C date -d "$ds" +%s 2>/dev/null)"; then
+    printf '%s\n' "$epoch"
+    return 0
+  fi
+
+  if epoch="$(LC_TIME=C date -j -f "%b %e %T %Y %Z" "$ds" +%s 2>/dev/null)"; then
+    printf '%s\n' "$epoch"
+    return 0
+  fi
+
+  if have_cmd python3; then
+    python3 - "$ds" <<'PY' 2>/dev/null
+import calendar
+import datetime as _dt
+import sys
+
+value = sys.argv[1]
+normalized = " ".join(value.split())
+for fmt in ("%b %d %H:%M:%S %Y %Z", "%b %d %H:%M:%S %Y"):
+    try:
+        dt = _dt.datetime.strptime(normalized, fmt)
+        print(calendar.timegm(dt.timetuple()))
+        sys.exit(0)
+    except ValueError:
+        pass
+sys.exit(1)
+PY
+    return $?
+  fi
+
+  return 1
+}
+
+# ============================================================
+# v2.1 新增: ASN 检测
+# ============================================================
+
+# 查询 IP 的 ASN 信息
+# 返回: "asn|asn_name|asn_type"
+# asn_type: CDN / Hosting / ISP / Edu / 未知
+lookup_asn() {
+  local ip="$1"
+  local whois_out asn="-" name="-" type="未知"
+  local cymru_line upper
+
+  [ "$ASN_ENABLED" -ne 1 ] && { echo "-|-|未知"; return; }
+  [ -z "$ip" ] || [ "$ip" = "-" ] && { echo "-|-|未知"; return; }
+
+  # IPv4 正则检查, 先排除无效输入
+  if ! [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    echo "-|-|未知"
+    return
+  fi
+
+  if have_cmd whois; then
+    whois_out="$(safe_timeout "$ASN_TIMEOUT_SEC" whois -h whois.cymru.com " -v $ip" 2>/dev/null | strip_nul_bytes)"
+    # 取第一条非表头行, 字段形如: AS | IP | BGP Prefix | CC | Registry | Allocated | AS Name
+    cymru_line="$(echo "$whois_out" | awk -F'|' 'NR>1 && NF>=7 {print; exit}')"
+    if [ -n "$cymru_line" ]; then
+      asn="$(echo "$cymru_line" | awk -F'|' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$1); print $1}')"
+      name="$(echo "$cymru_line" | awk -F'|' '{gsub(/^[[:space:]]+|[[:space:]]+$/,"",$7); print $7}')"
+    fi
+  fi
+
+  # ASN 分类: 基于名字做启发式 (快速离线方案)
+  upper="$(printf '%s' "$name" | tr 'a-z' 'A-Z')"
+  case "$upper" in
+    *CLOUDFLARE*|*FASTLY*|*AKAMAI*|*CDNETWORKS*|*CLOUDFRONT*|*CDN77*|*LIMELIGHT*|*STACKPATH*|*BUNNY*|*EDGE*|*AZURE*CDN*)
+      type="CDN" ;;
+    *GOOGLE*|*AMAZON*|*AWS*|*MICROSOFT*|*FACEBOOK*|*META*|*APPLE*|*NETFLIX*|*TWITTER*|*ORACLE*|*ALIBABA*|*TENCENT*)
+      type="CDN" ;;
+    *DIGITALOCEAN*|*LINODE*|*VULTR*|*OVH*|*HETZNER*|*CONTABO*|*SCALEWAY*|*LEASEWEB*|*CHOOPA*|*HOSTING*|*SERVER*|*DATACENTER*)
+      type="Hosting" ;;
+    *UNIVERSITY*|*UNIV*|*COLLEGE*|*SCHOOL*|*EDU*|*ACADEMIC*)
+      type="Edu" ;;
+    *TELECOM*|*COMCAST*|*VERIZON*|*AT\&T*|*DEUTSCHE*|*CHINA*|*KOREA*|*BROADBAND*|*ISP*|*COMMUNICATIONS*)
+      type="ISP" ;;
+    -|"") type="未知" ;;
+    *) type="未知" ;;
+  esac
+
+  echo "${asn:--}|${name:--}|${type:-未知}"
+}
+
 rank_result() {
   case "$1" in
     推荐) echo 4 ;;
@@ -185,7 +325,8 @@ check_curl_once() {
   local data t_connect t_appconnect t_starttransfer http_ver code ctype size eff remote_ip
 
   if ! have_cmd curl; then
-    echo "缺失|缺失|缺失||缺失|缺失|0|-|-|-|-"
+    printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
+      "缺失" "缺失" "缺失" "" "缺失" "缺失" "0" "-" "-" "-" "-"
     return
   fi
 
@@ -216,15 +357,27 @@ check_curl_once() {
     ttfb_ms="失败"
   fi
 
-  body="$(tr -d '\000' < "$body_file" 2>/dev/null || true)"
-  headers="$(tr -d '\000' < "$header_file" 2>/dev/null || true)"
+  # curl 超时、DNS/TLS 失败或被远端提前断开时，-o/-D 目标文件可能不会生成。
+  # 不能直接用输入重定向读取不存在的文件，否则重定向错误会在 2>/dev/null 生效前打到终端。
+  if [ -f "$body_file" ]; then
+    body="$(tr -d '\000' < "$body_file" 2>/dev/null || true)"
+  else
+    body=""
+  fi
+
+  if [ -f "$header_file" ]; then
+    headers="$(tr -d '\000' < "$header_file" 2>/dev/null || true)"
+  else
+    headers=""
+  fi
+
   rm -f "$body_file" "$header_file" 2>/dev/null || true
 
   title_line="$(echo "$body" | tr '\n' ' ' | sed -n 's/.*<title[^>]*>\(.*\)<\/title>.*/\1/p' | head -n1)"
   title="$(echo "$title_line" | sed 's/[[:space:]]\+/ /g' | cut -c1-100)"
   headers="$(printf '%s' "$headers" | tr '\r\n' ' ' | sed 's/[[:space:]]\+/ /g' | cut -c1-600)"
 
-  printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
+  printf '%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\x1f%s\n' \
     "$tcp_ms" "$tls_ms" "$ttfb_ms" "$http_ver" "$code" "${ctype:--}" "${size:-0}" "${eff:--}" "${title:--}" "${headers:--}" "${remote_ip:--}"
 }
 
@@ -344,7 +497,12 @@ check_h2() {
   local data ver code
 
   if ! have_cmd curl; then
-    echo "不支持"
+    echo "未知"
+    return
+  fi
+
+  if ! curl_supports_http2; then
+    echo "未知"
     return
   fi
 
@@ -385,7 +543,12 @@ check_h2_on_ip() {
   local data ver code
 
   if ! have_cmd curl; then
-    echo "不支持"
+    echo "未知"
+    return
+  fi
+
+  if ! curl_supports_http2; then
+    echo "未知"
     return
   fi
 
@@ -474,7 +637,7 @@ sample_ip_consistency() {
   local primary_san_level="$5"
   local primary_cert_fp="$6"
   local max_time="${TIMEOUT_SEC:-10}"
-  local ips ip_count=0 checked=0 mismatch=0 ip bundle cert_pem cert_text tls13_ip x25519_ip h2_ip san_ip cert_fp_ip
+  local ips ip_count=0 checked=0 mismatch=0 ip bundle cert_pem cert_text tls13_ip x25519_ip alpn_ip h2_ip san_ip cert_fp_ip
 
   if ! have_cmd openssl; then
     echo "单IP/未知"
@@ -497,7 +660,9 @@ sample_ip_consistency() {
     cert_text="$(cert_text_from_pem "$cert_pem")"
     tls13_ip="$(check_tls13_from_sclient "$bundle")"
     x25519_ip="$(check_x25519_from_sclient "$bundle")"
+    alpn_ip="$(check_alpn_result_from_sclient "$bundle")"
     h2_ip="$(check_h2_on_ip "$domain" "$ip")"
+    [ "$h2_ip" = "未知" ] && [ "$alpn_ip" = "h2" ] && h2_ip="支持"
     san_ip="$(check_san_level "$domain" "$cert_text")"
     cert_fp_ip="$(get_cert_fingerprint_from_pem "$cert_pem")"
     checked=$((checked + 1))
@@ -533,14 +698,12 @@ days_to_expiry_from_pem() {
   local enddate end_epoch now_epoch days
   enddate="$(echo "$pem" | openssl x509 -noout -enddate 2>/dev/null | sed 's/^notAfter=//')"
   [ -z "$enddate" ] && { echo ""; return; }
-  if date -d "$enddate" +%s >/dev/null 2>&1; then
-    end_epoch="$(date -d "$enddate" +%s)"
-    now_epoch="$(date +%s)"
-    days=$(( (end_epoch - now_epoch) / 86400 ))
-    echo "$days"
-  else
-    echo ""
-  fi
+  end_epoch="$(date_to_epoch "$enddate" || true)"
+  [ -n "$end_epoch" ] || { echo ""; return; }
+
+  now_epoch="$(date +%s)"
+  days=$(( (end_epoch - now_epoch) / 86400 ))
+  echo "$days"
 }
 
 get_issuer_short_from_pem() {
@@ -553,13 +716,26 @@ get_issuer_short_from_pem() {
 check_san_level() {
   local domain="$1"
   local cert_text="$2"
-  local san_line san_block item host suffix left
+  local san_block item host suffix left
+  local items=()
 
   [ -z "$cert_text" ] && { echo "失败"; return; }
-  san_line="$(echo "$cert_text" | awk '/X509v3 Subject Alternative Name/{getline; print}')"
-  [ -z "$san_line" ] && { echo "无SAN"; return; }
+  san_block="$(printf '%s\n' "$cert_text" | awk '
+    /X509v3 Subject Alternative Name/ {
+      sub(/^.*X509v3 Subject Alternative Name:[[:space:]]*/, "", $0)
+      if ($0 != "") print $0
+      flag=1
+      next
+    }
+    flag {
+      if ($0 ~ /^[[:space:]]*(X509v3 |Signature Algorithm:)/) exit
+      if ($0 ~ /^[[:space:]]*$/) next
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      print $0
+    }
+  ' | tr '\n' ',' | sed 's/,$//')"
+  [ -z "$san_block" ] && { echo "无SAN"; return; }
 
-  san_block="$(echo "$san_line" | sed 's/^[[:space:]]*//')"
   IFS=',' read -r -a items <<< "$san_block"
 
   for item in "${items[@]}"; do
@@ -702,6 +878,47 @@ is_reality_hard_fail() {
   fi
 }
 
+performance_gate_status() {
+  local tcp_ms="$1"
+  local tls_ms="$2"
+  local ttfb_ms="$3"
+  local tcp_var="$4"
+  local tls_var="$5"
+  local ttfb_var="$6"
+
+  local tcp_num tls_num ttfb_num tcp_var_num tls_var_num ttfb_var_num
+  tcp_num="$(num_or_big "$tcp_ms")"
+  tls_num="$(num_or_big "$tls_ms")"
+  ttfb_num="$(num_or_big "$ttfb_ms")"
+  tcp_var_num="$(num_or_big "$tcp_var")"
+  tls_var_num="$(num_or_big "$tls_var")"
+  ttfb_var_num="$(num_or_big "$ttfb_var")"
+
+  # 数值项门槛：超过硬阈值直接不建议，超过软阈值直接降为勉强。
+  # 只对真实可得的数值生效；999999 代表不可得，显示为 '-'，不在这里直接硬淘汰。
+  if { [ "$tcp_num" -lt 999999 ] && [ "$tcp_num" -gt 280 ]; } ||
+     { [ "$tls_num" -lt 999999 ] && [ "$tls_num" -gt 650 ]; } ||
+     { [ "$ttfb_num" -lt 999999 ] && [ "$ttfb_num" -gt 1200 ]; } ||
+     { [ "$tcp_var_num" -lt 999999 ] && [ "$tcp_var_num" -gt 120 ]; } ||
+     { [ "$tls_var_num" -lt 999999 ] && [ "$tls_var_num" -gt 130 ]; } ||
+     { [ "$ttfb_var_num" -lt 999999 ] && [ "$ttfb_var_num" -gt 650 ]; }; then
+    echo "不建议"
+    return
+  fi
+
+  if { [ "$tcp_num" -lt 999999 ] && [ "$tcp_num" -gt 200 ]; } ||
+     { [ "$tls_num" -lt 999999 ] && [ "$tls_num" -gt 300 ]; } ||
+     { [ "$ttfb_num" -lt 999999 ] && [ "$ttfb_num" -gt 900 ]; } ||
+     { [ "$tcp_var_num" -lt 999999 ] && [ "$tcp_var_num" -gt 80 ]; } ||
+     { [ "$tls_var_num" -lt 999999 ] && [ "$tls_var_num" -gt 90 ]; } ||
+     { [ "$ttfb_var_num" -lt 999999 ] && [ "$ttfb_var_num" -gt 450 ]; }; then
+    echo "勉强"
+    return
+  fi
+
+  echo "通过"
+}
+
 judge_sni() {
   local tls13="$1"
   local x25519="$2"
@@ -716,11 +933,16 @@ judge_sni() {
   local ttfb_ms="${11}"
   local expiry_days="${12}"
   local stability="${13}"
+  local tcp_ms="${14:-}"
+  local tcp_var="${15:-}"
+  local tls_var="${16:-}"
+  local ttfb_var="${17:-}"
 
-  local tls_num ttfb_num hard_fail
+  local tls_num ttfb_num hard_fail performance_gate
   tls_num="$(num_or_big "$tls_ms")"
   ttfb_num="$(num_or_big "$ttfb_ms")"
   hard_fail="$(is_reality_hard_fail "$tls13" "$x25519" "$h2" "$san_level" "$redirect")"
+  performance_gate="$(performance_gate_status "$tcp_ms" "$tls_ms" "$ttfb_ms" "$tcp_var" "$tls_var" "$ttfb_var")"
 
   if [ "$cert_ok" != "正常" ] || [ "$san_level" = "不匹配" ] || [ "$san_level" = "无SAN" ] || [ "$san_level" = "失败" ]; then
     echo "不建议"
@@ -737,7 +959,17 @@ judge_sni() {
     return
   fi
 
+  if [ "$performance_gate" = "不建议" ]; then
+    echo "不建议"
+    return
+  fi
+
   if [ "$waf" = "疑似挑战" ]; then
+    echo "勉强"
+    return
+  fi
+
+  if [ "$performance_gate" = "勉强" ]; then
     echo "勉强"
     return
   fi
@@ -799,9 +1031,10 @@ calc_sni_score() {
   local ocsp_stapling="${21}"
   local header_naturalness="${22}"
   local ip_consistency="${23}"
+  local asn_type="${24:-未知}"
 
   local score=0
-  local tcp_num tls_num ttfb_num tcp_var_num tls_var_num ttfb_var_num hard_fail
+  local tcp_num tls_num ttfb_num tcp_var_num tls_var_num ttfb_var_num hard_fail performance_gate
   tcp_num="$(num_or_big "$tcp_ms")"
   tls_num="$(num_or_big "$tls_ms")"
   ttfb_num="$(num_or_big "$ttfb_ms")"
@@ -809,8 +1042,9 @@ calc_sni_score() {
   tls_var_num="$(num_or_big "$tls_var")"
   ttfb_var_num="$(num_or_big "$ttfb_var")"
   hard_fail="$(is_reality_hard_fail "$tls13" "$x25519" "$h2" "$san_level" "$redirect")"
+  performance_gate="$(performance_gate_status "$tcp_ms" "$tls_ms" "$ttfb_ms" "$tcp_var" "$tls_var" "$ttfb_var")"
 
-  if [ "$hard_fail" = "1" ]; then
+  if [ "$hard_fail" = "1" ] || [ "$performance_gate" = "不建议" ]; then
     echo "-9999"
     return
   fi
@@ -865,148 +1099,148 @@ calc_sni_score() {
   esac
 
   case "$ocsp_stapling" in
-    支持) score=$((score + 6)) ;;
-    未提供) score=$((score - 2)) ;;
-    异常) score=$((score - 4)) ;;
+    支持) score=$((score + 2)) ;;
+    未提供) score=$((score + 0)) ;;
+    异常) score=$((score - 3)) ;;
     *) score=$((score + 0)) ;;
   esac
 
-  if [[ "$expiry_days" =~ ^-?[0-9]+$ ]]; then
-    if [ "$expiry_days" -ge 365 ]; then
-      score=$((score + 10))
-    elif [ "$expiry_days" -ge 180 ]; then
-      score=$((score + 8))
-    elif [ "$expiry_days" -ge 120 ]; then
-      score=$((score + 6))
-    elif [ "$expiry_days" -ge 90 ]; then
-      score=$((score + 4))
-    elif [ "$expiry_days" -ge 60 ]; then
-      score=$((score + 2))
-    elif [ "$expiry_days" -ge 30 ]; then
-      score=$((score + 0))
-    elif [ "$expiry_days" -ge 14 ]; then
-      score=$((score - 6))
-    elif [ "$expiry_days" -ge 7 ]; then
-      score=$((score - 14))
-    elif [ "$expiry_days" -ge 0 ]; then
-      score=$((score - 24))
-    else
-      score=$((score - 30))
-    fi
-  fi
+  # 证书剩余天数仅用于 judge_sni() 的临期硬保护，不再参与评分加减分。
 
-  # 第二层：站点自然性与可用性（次权重）
+  # 第二层：站点自然性与可用性（v2.1 修订：异常值扣分加重）
   case "$code" in
     200) score=$((score + 10)) ;;
     301|302) score=$((score + 7)) ;;
     403) score=$((score + 2)) ;;
-    404) score=$((score - 5)) ;;
-    405) score=$((score - 6)) ;;
-    *) score=$((score - 10)) ;;
+    404) score=$((score - 10)) ;;
+    405) score=$((score - 12)) ;;
+    *) score=$((score - 20)) ;;
   esac
 
   case "$page" in
     像正常网站) score=$((score + 12)) ;;
     HTML但特征弱) score=$((score + 6)) ;;
-    非HTML响应) score=$((score - 3)) ;;
-    错误页) score=$((score - 9)) ;;
+    非HTML响应) score=$((score - 6)) ;;
+    错误页) score=$((score - 18)) ;;
   esac
 
   case "$header_naturalness" in
     自然) score=$((score + 4)) ;;
     一般) score=$((score + 1)) ;;
-    异常) score=$((score - 4)) ;;
+    异常) score=$((score - 8)) ;;
   esac
 
   case "$redirect" in
     无跳转/同域) score=$((score + 7)) ;;
     主子域自然跳转) score=$((score + 4)) ;;
-    跨站跳转) score=$((score - 10)) ;;
+    跨站跳转) score=$((score - 20)) ;;
   esac
 
   case "$waf" in
     正常) score=$((score + 5)) ;;
-    疑似拦截) score=$((score - 6)) ;;
-    疑似挑战) score=$((score - 14)) ;;
+    疑似拦截) score=$((score - 12)) ;;
+    疑似挑战) score=$((score - 28)) ;;
   esac
 
   case "$ip_consistency" in
     一致) score=$((score + 5)) ;;
-    部分不一致) score=$((score - 4)) ;;
+    部分不一致) score=$((score - 8)) ;;
     *) score=$((score + 0)) ;;
   esac
 
-  # 第三层：性能与稳定性（补充细化项）
+  # v2.1 新增: ASN 类型权重, 鼓励选择大流量背景 ASN
+  case "$asn_type" in
+    CDN)     score=$((score + 8)) ;;
+    Hosting) score=$((score + 1)) ;;
+    ISP)     score=$((score + 0)) ;;
+    Edu)     score=$((score - 8)) ;;
+    *)       score=$((score + 0)) ;;
+  esac
+
+  # 第三层：性能与稳定性（v2.1 修订：异常值加倍扣分，抖动加分压缩）
+  # 设计原则：偏离大厂典型值越远，扣分越陡，因为异常本身就是风险信号
   case "$stability" in
     稳定) score=$((score + 7)) ;;
     一般) score=$((score + 1)) ;;
     波动大) score=$((score - 10)) ;;
   esac
 
-  [ "$tls_num" -le 20 ] && score=$((score + 8)) || \
-  [ "$tls_num" -le 30 ] && score=$((score + 7)) || \
-  [ "$tls_num" -le 40 ] && score=$((score + 6)) || \
-  [ "$tls_num" -le 55 ] && score=$((score + 5)) || \
-  [ "$tls_num" -le 70 ] && score=$((score + 4)) || \
-  [ "$tls_num" -le 90 ] && score=$((score + 3)) || \
-  [ "$tls_num" -le 120 ] && score=$((score + 2)) || \
-  [ "$tls_num" -le 160 ] && score=$((score + 0)) || \
-  [ "$tls_num" -le 220 ] && score=$((score - 2)) || \
-  [ "$tls_num" -le 300 ] && score=$((score - 4)) || \
-  score=$((score - 6))
+  # avg_tls: 正常范围加分不变，超过 160ms 急剧扣分
+  if   [ "$tls_num" -le 20 ];  then score=$((score + 8))
+  elif [ "$tls_num" -le 30 ];  then score=$((score + 7))
+  elif [ "$tls_num" -le 40 ];  then score=$((score + 6))
+  elif [ "$tls_num" -le 55 ];  then score=$((score + 5))
+  elif [ "$tls_num" -le 70 ];  then score=$((score + 4))
+  elif [ "$tls_num" -le 90 ];  then score=$((score + 3))
+  elif [ "$tls_num" -le 120 ]; then score=$((score + 2))
+  elif [ "$tls_num" -le 160 ]; then score=$((score + 0))
+  elif [ "$tls_num" -le 220 ]; then score=$((score - 6))
+  elif [ "$tls_num" -le 300 ]; then score=$((score - 14))
+  else                              score=$((score - 24))
+  fi
 
-  [ "$ttfb_num" -le 120 ] && score=$((score + 9)) || \
-  [ "$ttfb_num" -le 180 ] && score=$((score + 8)) || \
-  [ "$ttfb_num" -le 240 ] && score=$((score + 7)) || \
-  [ "$ttfb_num" -le 320 ] && score=$((score + 6)) || \
-  [ "$ttfb_num" -le 420 ] && score=$((score + 5)) || \
-  [ "$ttfb_num" -le 550 ] && score=$((score + 4)) || \
-  [ "$ttfb_num" -le 700 ] && score=$((score + 3)) || \
-  [ "$ttfb_num" -le 900 ] && score=$((score + 1)) || \
-  [ "$ttfb_num" -le 1200 ] && score=$((score - 1)) || \
-  [ "$ttfb_num" -le 1600 ] && score=$((score - 3)) || \
-  score=$((score - 6))
+  # avg_ttfb: 正常范围加分保留，超过 700ms 急剧扣分；900ms+ 视为明显风险信号
+  if   [ "$ttfb_num" -le 120 ];  then score=$((score + 9))
+  elif [ "$ttfb_num" -le 180 ];  then score=$((score + 8))
+  elif [ "$ttfb_num" -le 240 ];  then score=$((score + 7))
+  elif [ "$ttfb_num" -le 320 ];  then score=$((score + 6))
+  elif [ "$ttfb_num" -le 420 ];  then score=$((score + 5))
+  elif [ "$ttfb_num" -le 550 ];  then score=$((score + 4))
+  elif [ "$ttfb_num" -le 700 ];  then score=$((score + 2))
+  elif [ "$ttfb_num" -le 900 ];  then score=$((score - 6))
+  elif [ "$ttfb_num" -le 1200 ]; then score=$((score - 18))
+  elif [ "$ttfb_num" -le 1600 ]; then score=$((score - 32))
+  else                                score=$((score - 50))
+  fi
 
-  [ "$tcp_num" -le 15 ] && score=$((score + 6)) || \
-  [ "$tcp_num" -le 25 ] && score=$((score + 5)) || \
-  [ "$tcp_num" -le 35 ] && score=$((score + 4)) || \
-  [ "$tcp_num" -le 50 ] && score=$((score + 3)) || \
-  [ "$tcp_num" -le 70 ] && score=$((score + 2)) || \
-  [ "$tcp_num" -le 100 ] && score=$((score + 1)) || \
-  [ "$tcp_num" -le 140 ] && score=$((score + 0)) || \
-  [ "$tcp_num" -le 200 ] && score=$((score - 2)) || \
-  [ "$tcp_num" -le 280 ] && score=$((score - 4)) || \
-  score=$((score - 6))
+  # avg_tcp: 正常范围加分保留，超过 140ms 急剧扣分
+  if   [ "$tcp_num" -le 15 ];  then score=$((score + 6))
+  elif [ "$tcp_num" -le 25 ];  then score=$((score + 5))
+  elif [ "$tcp_num" -le 35 ];  then score=$((score + 4))
+  elif [ "$tcp_num" -le 50 ];  then score=$((score + 3))
+  elif [ "$tcp_num" -le 70 ];  then score=$((score + 2))
+  elif [ "$tcp_num" -le 100 ]; then score=$((score + 1))
+  elif [ "$tcp_num" -le 140 ]; then score=$((score + 0))
+  elif [ "$tcp_num" -le 200 ]; then score=$((score - 5))
+  elif [ "$tcp_num" -le 280 ]; then score=$((score - 12))
+  else                              score=$((score - 22))
+  fi
 
-  [ "$tcp_var_num" -le 5 ] && score=$((score + 4)) || \
-  [ "$tcp_var_num" -le 10 ] && score=$((score + 3)) || \
-  [ "$tcp_var_num" -le 20 ] && score=$((score + 2)) || \
-  [ "$tcp_var_num" -le 35 ] && score=$((score + 1)) || \
-  [ "$tcp_var_num" -le 55 ] && score=$((score + 0)) || \
-  [ "$tcp_var_num" -le 80 ] && score=$((score - 2)) || \
-  [ "$tcp_var_num" -le 120 ] && score=$((score - 4)) || \
-  score=$((score - 6))
+  # tcp_var: 加分大幅压缩, 异常值急剧扣分
+  if   [ "$tcp_var_num" -le 5 ];   then score=$((score + 2))
+  elif [ "$tcp_var_num" -le 10 ];  then score=$((score + 1))
+  elif [ "$tcp_var_num" -le 20 ];  then score=$((score + 0))
+  elif [ "$tcp_var_num" -le 35 ];  then score=$((score + 0))
+  elif [ "$tcp_var_num" -le 55 ];  then score=$((score - 2))
+  elif [ "$tcp_var_num" -le 80 ];  then score=$((score - 6))
+  elif [ "$tcp_var_num" -le 120 ]; then score=$((score - 12))
+  else                                  score=$((score - 20))
+  fi
 
-  [ "$tls_var_num" -le 5 ] && score=$((score + 5)) || \
-  [ "$tls_var_num" -le 10 ] && score=$((score + 4)) || \
-  [ "$tls_var_num" -le 18 ] && score=$((score + 3)) || \
-  [ "$tls_var_num" -le 28 ] && score=$((score + 2)) || \
-  [ "$tls_var_num" -le 40 ] && score=$((score + 1)) || \
-  [ "$tls_var_num" -le 60 ] && score=$((score + 0)) || \
-  [ "$tls_var_num" -le 90 ] && score=$((score - 2)) || \
-  [ "$tls_var_num" -le 130 ] && score=$((score - 4)) || \
-  score=$((score - 6))
+  # tls_var: 加分大幅压缩, 异常值急剧扣分
+  if   [ "$tls_var_num" -le 5 ];   then score=$((score + 2))
+  elif [ "$tls_var_num" -le 10 ];  then score=$((score + 1))
+  elif [ "$tls_var_num" -le 18 ];  then score=$((score + 0))
+  elif [ "$tls_var_num" -le 28 ];  then score=$((score + 0))
+  elif [ "$tls_var_num" -le 40 ];  then score=$((score - 2))
+  elif [ "$tls_var_num" -le 60 ];  then score=$((score - 5))
+  elif [ "$tls_var_num" -le 90 ];  then score=$((score - 10))
+  elif [ "$tls_var_num" -le 130 ]; then score=$((score - 16))
+  else                                  score=$((score - 25))
+  fi
 
-  [ "$ttfb_var_num" -le 20 ] && score=$((score + 6)) || \
-  [ "$ttfb_var_num" -le 40 ] && score=$((score + 5)) || \
-  [ "$ttfb_var_num" -le 70 ] && score=$((score + 4)) || \
-  [ "$ttfb_var_num" -le 110 ] && score=$((score + 3)) || \
-  [ "$ttfb_var_num" -le 160 ] && score=$((score + 2)) || \
-  [ "$ttfb_var_num" -le 230 ] && score=$((score + 1)) || \
-  [ "$ttfb_var_num" -le 320 ] && score=$((score - 1)) || \
-  [ "$ttfb_var_num" -le 450 ] && score=$((score - 3)) || \
-  [ "$ttfb_var_num" -le 650 ] && score=$((score - 5)) || \
-  score=$((score - 7))
+  # ttfb_var: 加分大幅压缩, 异常值急剧扣分(抖动往往反映WAF干扰或路径不稳)
+  if   [ "$ttfb_var_num" -le 20 ];  then score=$((score + 2))
+  elif [ "$ttfb_var_num" -le 40 ];  then score=$((score + 1))
+  elif [ "$ttfb_var_num" -le 70 ];  then score=$((score + 0))
+  elif [ "$ttfb_var_num" -le 110 ]; then score=$((score + 0))
+  elif [ "$ttfb_var_num" -le 160 ]; then score=$((score - 2))
+  elif [ "$ttfb_var_num" -le 230 ]; then score=$((score - 5))
+  elif [ "$ttfb_var_num" -le 320 ]; then score=$((score - 10))
+  elif [ "$ttfb_var_num" -le 450 ]; then score=$((score - 18))
+  elif [ "$ttfb_var_num" -le 650 ]; then score=$((score - 30))
+  else                                   score=$((score - 45))
+  fi
 
   echo "$score"
 }
@@ -1027,17 +1261,7 @@ probe_one() {
 
   for row in "${sample_rows[@]}"; do
     local tcp_ms tls_ms ttfb_ms http_ver code ctype size final_url title headers remote_ip
-    tcp_ms="$(echo "$row" | cut -d'|' -f1)"
-    tls_ms="$(echo "$row" | cut -d'|' -f2)"
-    ttfb_ms="$(echo "$row" | cut -d'|' -f3)"
-    http_ver="$(echo "$row" | cut -d'|' -f4)"
-    code="$(echo "$row" | cut -d'|' -f5)"
-    ctype="$(echo "$row" | cut -d'|' -f6)"
-    size="$(echo "$row" | cut -d'|' -f7)"
-    final_url="$(echo "$row" | cut -d'|' -f8)"
-    title="$(echo "$row" | cut -d'|' -f9)"
-    headers="$(echo "$row" | cut -d'|' -f10)"
-    remote_ip="$(echo "$row" | cut -d'|' -f11)"
+    IFS=$'\x1f' read -r tcp_ms tls_ms ttfb_ms http_ver code ctype size final_url title headers remote_ip <<< "$row"
 
     local tls_num ttfb_num tcp_num
     tcp_num="$(num_or_big "$tcp_ms")"
@@ -1079,6 +1303,12 @@ probe_one() {
   [ -n "$min_tcp" ] && [ -n "$max_tcp" ] && tcp_var=$((max_tcp - min_tcp)) || tcp_var=999999
   [ -n "$min_tls" ] && [ -n "$max_tls" ] && tls_var=$((max_tls - min_tls)) || tls_var=999999
   [ -n "$min_ttfb" ] && [ -n "$max_ttfb" ] && ttfb_var=$((max_ttfb - min_ttfb)) || ttfb_var=999999
+
+  # v2.1 修正: 只有 1 个成功样本时, max-min=0 会被误判为"抖动极小", 应视为"抖动未知"
+  [ "${#tcp_nums[@]}" -lt 2 ] && tcp_var=999999
+  [ "${#tls_nums[@]}" -lt 2 ] && tls_var=999999
+  [ "${#ttfb_nums[@]}" -lt 2 ] && ttfb_var=999999
+
   stability="$(stability_level "$ok_count" "$SAMPLES" "$tls_var" "$ttfb_var")"
 
   if [ -n "$avg_ttfb" ]; then
@@ -1088,7 +1318,7 @@ probe_one() {
   fi
 
   if [ "$tcp_var" -lt 999999 ] || [ "$tls_var" -lt 999999 ] || [ "$ttfb_var" -lt 999999 ]; then
-    jitter="TCP:${tcp_var:-?}ms/TLS:${tls_var:-?}ms/TTFB:${ttfb_var:-?}ms"
+    jitter="$(jitter_token TCP "$tcp_var")/$(jitter_token TLS "$tls_var")/$(jitter_token TTFB "$ttfb_var")"
   else
     jitter="-"
   fi
@@ -1105,6 +1335,7 @@ probe_one() {
   }
 
   local bundle sclient cert_pem cert_text tls13 x25519 h2 alpn_result cert_ok cert_chain_status san_level cert_fp ocsp_stapling expiry_raw expiry_days issuer redirect waf page header_naturalness ip_consistency result score expiry_show
+  local asn_raw asn asn_name asn_type
  
   bundle="$(fetch_tls_bundle "$domain")"
   if [ "$bundle" = "NO_OPENSSL" ]; then
@@ -1125,7 +1356,17 @@ probe_one() {
  
   case "$best_http_ver" in
     2|2.0) h2="支持" ;;
-    *) h2="$(check_h2 "$domain")" ;;
+    *)
+      # v2.2: curl 无 HTTP/2 能力时，优先使用 openssl ALPN 结果兜底，避免误判为不支持
+      if [ "$alpn_result" = "h2" ]; then
+        h2="支持"
+      elif [ "$best_code" = "-" ]; then
+        h2="未知"
+      else
+        h2="$(check_h2 "$domain")"
+        [ "$h2" = "未知" ] && [ "$alpn_result" = "h2" ] && h2="支持"
+      fi
+      ;;
   esac
  
   cert_ok="$(check_cert_ok "$cert_pem")"
@@ -1145,6 +1386,12 @@ probe_one() {
   page="$(page_naturalness "$best_code" "$best_ctype" "$best_size" "$best_title")"
   header_naturalness="$(check_header_naturalness "$best_code" "$best_ctype" "$best_headers")"
   ip_consistency="$(sample_ip_consistency "$domain" "$tls13" "$x25519" "$h2" "$san_level" "$cert_fp")"
+
+  # v2.1 新增: ASN 查询
+  asn_raw="$(lookup_asn "$best_remote_ip")"
+  asn="$(echo "$asn_raw" | cut -d'|' -f1)"
+  asn_name="$(echo "$asn_raw" | cut -d'|' -f2)"
+  asn_type="$(echo "$asn_raw" | cut -d'|' -f3)"
  
   local avg_tcp_show avg_tls_show avg_ttfb_show tls_for_judge ttfb_for_judge
   [ -n "$avg_tcp" ] && avg_tcp_show="${avg_tcp}ms" || avg_tcp_show="-"
@@ -1153,13 +1400,14 @@ probe_one() {
   tls_for_judge="$avg_tls_show"
   ttfb_for_judge="$avg_ttfb_show"
  
-  result="$(judge_sni "$tls13" "$x25519" "$h2" "$cert_ok" "$san_level" "$best_code" "$waf" "$page" "$redirect" "$tls_for_judge" "$ttfb_for_judge" "$expiry_days" "$stability")"
-  score="$(calc_sni_score "$tls13" "$x25519" "$h2" "$alpn_result" "$cert_ok" "$cert_chain_status" "$san_level" "$best_code" "$waf" "$page" "$redirect" "$tls_for_judge" "$ttfb_for_judge" "$expiry_days" "$result" "$stability" "$tls_var" "$ttfb_var" "$avg_tcp" "$tcp_var" "$ocsp_stapling" "$header_naturalness" "$ip_consistency")"
- 
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  result="$(judge_sni "$tls13" "$x25519" "$h2" "$cert_ok" "$san_level" "$best_code" "$waf" "$page" "$redirect" "$tls_for_judge" "$ttfb_for_judge" "$expiry_days" "$stability" "$avg_tcp_show" "$tcp_var" "$tls_var" "$ttfb_var")"
+  score="$(calc_sni_score "$tls13" "$x25519" "$h2" "$alpn_result" "$cert_ok" "$cert_chain_status" "$san_level" "$best_code" "$waf" "$page" "$redirect" "$tls_for_judge" "$ttfb_for_judge" "$expiry_days" "$result" "$stability" "$tls_var" "$ttfb_var" "$avg_tcp" "$tcp_var" "$ocsp_stapling" "$header_naturalness" "$ip_consistency" "$asn_type")"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$domain" "$best_code" "$avg_tcp_show" "$avg_tls_show" "$avg_ttfb_show" \
     "$avg_latency" "$jitter" "$tcp_var" "$tls_var" "$ttfb_var" \
-    "$tls13" "$x25519" "$h2" "$alpn_result" "$cert_ok" "$cert_chain_status" "$san_level" "$ocsp_stapling" "$page" "$header_naturalness" "$waf" "$redirect" "$ip_consistency" "$stability" "$score" "$result" "$issuer" "$best_final_url" "$best_title" "$best_ctype" "$best_size" "$best_remote_ip"
+    "$tls13" "$x25519" "$h2" "$alpn_result" "$cert_ok" "$cert_chain_status" "$san_level" "$ocsp_stapling" "$page" "$header_naturalness" "$waf" "$redirect" "$ip_consistency" "$stability" "$score" "$result" "$issuer" "$best_final_url" "$best_title" "$best_ctype" "$best_size" "$best_remote_ip" \
+    "$asn" "$asn_type"
 }
 
 worker_main() {
@@ -1173,11 +1421,21 @@ run_with_limit() {
     [ "$(jobs -rp | wc -l)" -lt "$max_jobs" ] && break
     sleep 0.1
   done
+  # v2.1 新增: 在达到并发上限之前, 给每个 worker 启动加上随机延迟
+  # 用途: 避免一批域名以完全相同的节奏发出请求, 降低被云端 WAF 聚类识别的概率
+  if [ "$JITTER_MS_MAX" -gt 0 ]; then
+    local rand_ms rand_sec
+    rand_ms=$(( RANDOM % (JITTER_MS_MAX + 1) ))
+    if [ "$rand_ms" -gt 0 ]; then
+      rand_sec="$(awk -v m="$rand_ms" 'BEGIN{printf "%.3f", m/1000}')"
+      sleep "$rand_sec" 2>/dev/null || true
+    fi
+  fi
   "$@" &
 }
 
-TABLE_WIDTHS=(26 4 8 8 8 8 14 6 6 4 8 6 4 10 8 10 6 8 14 10 6 5 6)
-TABLE_HEADERS=("域名" "码" "TCP建连" "TLS握手" "TTFB" "平均延迟" "抖动T/TLS/F" "TLS13" "X25519" "H2" "ALPN" "OCSP" "证书" "链" "SAN" "页面" "头部" "WAF" "跳转" "多IP" "稳定性" "评分" "结论")
+TABLE_WIDTHS=(26 4 8 8 8 8 14 6 6 6 8 8 4 14 8 10 6 8 10 10 6 6 5 6)
+TABLE_HEADERS=("域名" "码" "TCP建连" "TLS握手" "TTFB" "平均延迟" "抖动T/TLS/F" "TLS13" "X25519" "H2" "ALPN" "SAN" "证书" "跳转" "WAF" "页面" "稳定性" "ASN类型" "多IP" "链" "头部" "OCSP" "评分" "结论")
 
 table_strip_ansi() {
   local s="${1:-}"
@@ -1281,11 +1539,11 @@ table_print_row() {
 print_table() {
   local sorted_file="$1"
 
-  echo "REALITY SNI 专业评估 v2"
+  echo "REALITY SNI 专业评估 v2.2"
   table_print_row "${TABLE_HEADERS[@]}"
   table_print_rule
 
-  while IFS=$'\t' read -r domain code avg_tcp avg_tls avg_ttfb avg_latency jitter tcp_var tls_var ttfb_var tls13 x25519 h2 alpn_result cert_ok cert_chain_status san_level ocsp_stapling page header_naturalness waf redirect ip_consistency stability score result issuer final_url title ctype size remote_ip; do
+  while IFS=$'\t' read -r domain code avg_tcp avg_tls avg_ttfb avg_latency jitter tcp_var tls_var ttfb_var tls13 x25519 h2 alpn_result cert_ok cert_chain_status san_level ocsp_stapling page header_naturalness waf redirect ip_consistency stability score result issuer final_url title ctype size remote_ip asn asn_type; do
     local type_label="-"
     local tcp_var_show="$tcp_var"
     local tls_var_show="$tls_var"
@@ -1311,7 +1569,7 @@ print_table() {
 
     table_print_row \
       "$domain" "$code" "$avg_tcp" "$avg_tls" "$avg_ttfb" "$avg_latency" "$jitter_compact" \
-      "$tls13" "$x25519" "$h2" "$alpn_result" "$ocsp_stapling" "$cert_ok" "$cert_chain_status" "$san_level" "$type_label" "$header_naturalness" "$waf" "$redirect" "$ip_consistency" "$stability" "$score" "$result"
+      "$tls13" "$x25519" "$h2" "$alpn_result" "$san_level" "$cert_ok" "$redirect" "$waf" "$type_label" "$stability" "${asn_type:-未知}" "$ip_consistency" "$cert_chain_status" "$header_naturalness" "$ocsp_stapling" "$score" "$result"
   done < "$sorted_file"
 
   table_print_rule
@@ -1321,15 +1579,16 @@ export_csv() {
   local sorted_file="$1"
   local out="$2"
   {
-    echo '"domain","code","avg_tcp","avg_tls","avg_ttfb","avg_latency","jitter","tcp_jitter","tls_jitter","ttfb_jitter","tls13","x25519","h2","alpn_result","cert_ok","cert_chain_status","san_level","ocsp_stapling","page","header_naturalness","waf","redirect","ip_consistency","stability","score","result","issuer","final_url","title","content_type","size","remote_ip"'
-    while IFS=$'\t' read -r domain code avg_tcp avg_tls avg_ttfb avg_latency jitter tcp_var tls_var ttfb_var tls13 x25519 h2 alpn_result cert_ok cert_chain_status san_level ocsp_stapling page header_naturalness waf redirect ip_consistency stability score result issuer final_url title ctype size remote_ip; do
-      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    echo '"domain","code","avg_tcp","avg_tls","avg_ttfb","avg_latency","jitter","tcp_jitter","tls_jitter","ttfb_jitter","tls13","x25519","h2","alpn_result","cert_ok","cert_chain_status","san_level","ocsp_stapling","page","header_naturalness","waf","redirect","ip_consistency","stability","score","result","issuer","final_url","title","content_type","size","remote_ip","asn","asn_type"'
+    while IFS=$'\t' read -r domain code avg_tcp avg_tls avg_ttfb avg_latency jitter tcp_var tls_var ttfb_var tls13 x25519 h2 alpn_result cert_ok cert_chain_status san_level ocsp_stapling page header_naturalness waf redirect ip_consistency stability score result issuer final_url title ctype size remote_ip asn asn_type; do
+      printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
         "$(csv_escape "$domain")" "$(csv_escape "$code")" "$(csv_escape "$avg_tcp")" "$(csv_escape "$avg_tls")" "$(csv_escape "$avg_ttfb")" \
-        "$(csv_escape "$avg_latency")" "$(csv_escape "$jitter")" "$(csv_escape "${tcp_var}ms")" "$(csv_escape "${tls_var}ms")" "$(csv_escape "${ttfb_var}ms")" \
+        "$(csv_escape "$avg_latency")" "$(csv_escape "$jitter")" "$(csv_escape "$(ms_or_dash "$tcp_var")")" "$(csv_escape "$(ms_or_dash "$tls_var")")" "$(csv_escape "$(ms_or_dash "$ttfb_var")")" \
         "$(csv_escape "$tls13")" "$(csv_escape "$x25519")" "$(csv_escape "$h2")" "$(csv_escape "$alpn_result")" "$(csv_escape "$cert_ok")" "$(csv_escape "$cert_chain_status")" \
         "$(csv_escape "$san_level")" "$(csv_escape "$ocsp_stapling")" "$(csv_escape "$page")" "$(csv_escape "$header_naturalness")" "$(csv_escape "$waf")" "$(csv_escape "$redirect")" \
         "$(csv_escape "$ip_consistency")" "$(csv_escape "$stability")" "$(csv_escape "$score")" "$(csv_escape "$result")" "$(csv_escape "$issuer")" "$(csv_escape "$final_url")" \
-        "$(csv_escape "$title")" "$(csv_escape "$ctype")" "$(csv_escape "$size")" "$(csv_escape "$remote_ip")"
+        "$(csv_escape "$title")" "$(csv_escape "$ctype")" "$(csv_escape "$size")" "$(csv_escape "$remote_ip")" \
+        "$(csv_escape "${asn:--}")" "$(csv_escape "${asn_type:-未知}")"
     done < "$sorted_file"
   } > "$out"
   echo "CSV 已导出: $out"
@@ -1339,14 +1598,15 @@ export_jsonl() {
   local sorted_file="$1"
   local out="$2"
   : > "$out"
-  while IFS=$'\t' read -r domain code avg_tcp avg_tls avg_ttfb avg_latency jitter tcp_var tls_var ttfb_var tls13 x25519 h2 alpn_result cert_ok cert_chain_status san_level ocsp_stapling page header_naturalness waf redirect ip_consistency stability score result issuer final_url title ctype size remote_ip; do
-    printf '{"domain":"%s","code":"%s","avg_tcp":"%s","avg_tls":"%s","avg_ttfb":"%s","avg_latency":"%s","jitter":"%s","tcp_jitter":"%s","tls_jitter":"%s","ttfb_jitter":"%s","tls13":"%s","x25519":"%s","h2":"%s","alpn_result":"%s","cert_ok":"%s","cert_chain_status":"%s","san_level":"%s","ocsp_stapling":"%s","page":"%s","header_naturalness":"%s","waf":"%s","redirect":"%s","ip_consistency":"%s","stability":"%s","score":"%s","result":"%s","issuer":"%s","final_url":"%s","title":"%s","content_type":"%s","size":"%s","remote_ip":"%s"}\n' \
+  while IFS=$'\t' read -r domain code avg_tcp avg_tls avg_ttfb avg_latency jitter tcp_var tls_var ttfb_var tls13 x25519 h2 alpn_result cert_ok cert_chain_status san_level ocsp_stapling page header_naturalness waf redirect ip_consistency stability score result issuer final_url title ctype size remote_ip asn asn_type; do
+    printf '{"domain":"%s","code":"%s","avg_tcp":"%s","avg_tls":"%s","avg_ttfb":"%s","avg_latency":"%s","jitter":"%s","tcp_jitter":"%s","tls_jitter":"%s","ttfb_jitter":"%s","tls13":"%s","x25519":"%s","h2":"%s","alpn_result":"%s","cert_ok":"%s","cert_chain_status":"%s","san_level":"%s","ocsp_stapling":"%s","page":"%s","header_naturalness":"%s","waf":"%s","redirect":"%s","ip_consistency":"%s","stability":"%s","score":"%s","result":"%s","issuer":"%s","final_url":"%s","title":"%s","content_type":"%s","size":"%s","remote_ip":"%s","asn":"%s","asn_type":"%s"}\n' \
       "$(json_escape "$domain")" "$(json_escape "$code")" "$(json_escape "$avg_tcp")" "$(json_escape "$avg_tls")" "$(json_escape "$avg_ttfb")" \
-      "$(json_escape "$avg_latency")" "$(json_escape "$jitter")" "$(json_escape "${tcp_var}ms")" "$(json_escape "${tls_var}ms")" "$(json_escape "${ttfb_var}ms")" \
+      "$(json_escape "$avg_latency")" "$(json_escape "$jitter")" "$(json_escape "$(ms_or_dash "$tcp_var")")" "$(json_escape "$(ms_or_dash "$tls_var")")" "$(json_escape "$(ms_or_dash "$ttfb_var")")" \
       "$(json_escape "$tls13")" "$(json_escape "$x25519")" "$(json_escape "$h2")" "$(json_escape "$alpn_result")" "$(json_escape "$cert_ok")" "$(json_escape "$cert_chain_status")" \
       "$(json_escape "$san_level")" "$(json_escape "$ocsp_stapling")" "$(json_escape "$page")" "$(json_escape "$header_naturalness")" "$(json_escape "$waf")" "$(json_escape "$redirect")" \
       "$(json_escape "$ip_consistency")" "$(json_escape "$stability")" "$(json_escape "$score")" "$(json_escape "$result")" "$(json_escape "$issuer")" "$(json_escape "$final_url")" \
-      "$(json_escape "$title")" "$(json_escape "$ctype")" "$(json_escape "$size")" "$(json_escape "$remote_ip")" >> "$out"
+      "$(json_escape "$title")" "$(json_escape "$ctype")" "$(json_escape "$size")" "$(json_escape "$remote_ip")" \
+      "$(json_escape "${asn:--}")" "$(json_escape "${asn_type:-未知}")" >> "$out"
   done < "$sorted_file"
   echo "JSONL 已导出: $out"
 }
@@ -1428,6 +1688,15 @@ main() {
         [[ "$1" =~ ^-?[0-9]+([.][0-9]+)?$ ]] || { echo "错误: --min-score 必须是数值" >&2; exit 1; }
         MIN_SCORE="$1"
         ;;
+      --jitter)
+        shift
+        [ $# -eq 0 ] && { echo "错误: --jitter 需要数值参数" >&2; usage; exit 1; }
+        [[ "$1" =~ ^[0-9]+$ ]] || { echo "错误: --jitter 必须是非负整数毫秒" >&2; exit 1; }
+        JITTER_MS_MAX="$1"
+        ;;
+      --no-asn)
+        ASN_ENABLED=0
+        ;;
       -h|--help)
         usage
         exit 0
@@ -1444,6 +1713,8 @@ main() {
   mapfile -t domains < <(printf '%s\n' "${domains[@]}" | awk 'NF' | dedup_domains)
   [ "${#domains[@]}" -eq 0 ] && { echo "错误: 没有有效域名" >&2; exit 1; }
 
+  warn_dependencies
+
   tmp_dir="$(mktemp -d)"
   TMP_ROOT="$tmp_dir"
   trap '[ -n "${TMP_ROOT:-}" ] && rm -rf "$TMP_ROOT"' EXIT
@@ -1451,7 +1722,7 @@ main() {
   for domain in "${domains[@]}"; do
     idx=$((idx + 1))
     out_file="$tmp_dir/$idx.tsv"
-    run_with_limit "$JOBS" env -u LC_ALL LANG="${LANG:-${LC_CTYPE:-C.UTF-8}}" LC_CTYPE="${LC_CTYPE:-${LANG:-C.UTF-8}}" TIMEOUT_SEC="$TIMEOUT_SEC" SAMPLES="$SAMPLES" TMP_ROOT="$tmp_dir" UTF8_BOOTSTRAP_DONE=1 bash "$0" --worker "$domain" > "$out_file"
+    run_with_limit "$JOBS" env -u LC_ALL LANG="${LANG:-${LC_CTYPE:-C.UTF-8}}" LC_CTYPE="${LC_CTYPE:-${LANG:-C.UTF-8}}" TIMEOUT_SEC="$TIMEOUT_SEC" SAMPLES="$SAMPLES" TMP_ROOT="$tmp_dir" ASN_ENABLED="$ASN_ENABLED" ASN_TIMEOUT_SEC="$ASN_TIMEOUT_SEC" UTF8_BOOTSTRAP_DONE=1 bash "$0" --worker "$domain" > "$out_file"
   done
   wait
 
